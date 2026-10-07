@@ -1,0 +1,1593 @@
+# =============================================================================
+# ESPHome + LVGL wall panel for Home Assistant (800x480 RGB, CH422G, GT911)
+#
+# Pages (swipe left/right): clock, thermostat, weather, today's sun and rain,
+# wind and rain compass, 7-day forecast, energy, awning, blinds, light.
+#
+# Everything that is specific to your house lives in the `substitutions` block
+# below. UI labels are in Catalan; edit the strings in this file to translate.
+# See README.md for what each page needs and how to remove pages you do not use.
+# =============================================================================
+
+substitutions:
+  device_name: living-room-panel
+  device_friendly_name: Living Room Panel
+  timezone: Europe/Madrid
+  town_name: "YOUR TOWN"
+  # SHT3x sits next to the display and reads high. Calibrate it against a
+  # reference thermometer placed 30 cm away (the author needed -6.12).
+  temp_offset: "0.0"
+
+  # --- Thermostat page -------------------------------------------------------
+  thermostat_entity: climate.living_room_thermostat
+  boiler_state_entity: sensor.boiler_statenumber   # Statenumber of the boiler (S.xx code)
+
+  # --- Presence, light, awning, blinds ---------------------------------------
+  presence_entity: binary_sensor.living_room_presence
+  lamp_entity: switch.living_room_lamp
+  awning_entity: cover.awning
+  blind_right_entity: cover.blind_right
+  blind_left_entity: cover.blind_left
+
+  # --- Weather pages (Meteocat integration; station id as in its entity names)
+  meteocat_station: your_station
+  today_max_entity: sensor.today_max_temperature
+  today_min_entity: sensor.today_min_temperature
+  rain_probability_entity: sensor.rain_probability
+  week_forecast_entity: sensor.week_forecast   # attributes `maxs` and `mins`: comma-separated integers
+  sunrise_entity: sensor.sunrise_time          # text "HH:MM"
+  sunset_entity: sensor.sunset_time            # text "HH:MM"
+
+  # --- Energy page -----------------------------------------------------------
+  solar_power_entity: sensor.solar_power       # W
+  house_power_entity: sensor.house_power       # W
+  grid_power_entity: sensor.grid_power         # W, positive = buying, negative = selling
+  appliance_signal_entity: sensor.appliance_traffic_light   # text: verd / ambre / vermell / nit
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${device_friendly_name}
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+api:
+ota:
+  - platform: esphome
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: ${timezone}
+
+globals:
+  - id: g_touching
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_start_x
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: g_last_x
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: g_black
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g_swiped
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: sel_persiana
+    type: int
+    restore_value: no
+    initial_value: '0'   # 0 = dreta, 1 = esquerra
+  - id: wk_max
+    type: int[7]
+    restore_value: no
+    initial_value: '{0,0,0,0,0,0,0}'
+  - id: wk_min
+    type: int[7]
+    restore_value: no
+    initial_value: '{0,0,0,0,0,0,0}'
+
+i2c:
+  sda: GPIO8
+  scl: GPIO9
+  frequency: 400kHz
+  scan: true
+
+ch422g:
+  - id: ch422g_hub
+
+output:
+  - platform: gpio
+    id: backlight_out
+    pin:
+      ch422g: ch422g_hub
+      number: 2
+      mode:
+        output: true
+
+light:
+  - platform: binary
+    name: "Backlight"
+    id: backlight_light
+    output: backlight_out
+    restore_mode: ALWAYS_ON
+
+display:
+  - platform: rpi_dpi_rgb
+    id: main_display
+    auto_clear_enabled: false
+    update_interval: never
+    dimensions:
+      width: 800
+      height: 480
+    color_order: RGB
+    pclk_frequency: 16MHz
+    pclk_inverted: true
+    de_pin: 5
+    hsync_pin: 46
+    vsync_pin: 3
+    pclk_pin: 7
+    hsync_pulse_width: 4
+    hsync_back_porch: 8
+    hsync_front_porch: 8
+    vsync_pulse_width: 4
+    vsync_back_porch: 8
+    vsync_front_porch: 8
+    reset_pin:
+      ch422g: ch422g_hub
+      number: 3
+    data_pins:
+      red:   [1, 2, 42, 41, 40]
+      green: [39, 0, 45, 48, 47, 21]
+      blue:  [14, 38, 18, 17, 10]
+
+touchscreen:
+  - platform: gt911
+    id: main_touch
+    display: main_display
+    interrupt_pin: GPIO4
+    reset_pin:
+      ch422g: ch422g_hub
+      number: 1
+    on_touch:
+      - if:
+          condition:
+            lambda: 'return id(g_black);'
+          then:
+            - lvgl.page.show: page_clock
+            - lambda: 'id(g_black) = false;'
+    on_update:
+      - lambda: |-
+          if (!touches.empty()) {
+            if (!id(g_touching)) {
+              id(g_touching) = true;
+              id(g_start_x) = touches[0].x;
+              id(g_swiped) = false;
+            }
+            id(g_last_x) = touches[0].x;
+            int dx = id(g_last_x) - id(g_start_x);
+            if (dx > 40 || dx < -40) id(g_swiped) = true;
+          }
+    on_release:
+      - lambda: 'id(g_touching) = false;'
+      - if:
+          condition:
+            lambda: 'return (id(g_last_x) - id(g_start_x)) < -60;'
+          then:
+            - lvgl.page.next:
+                animation: OUT_LEFT
+                time: 250ms
+      - if:
+          condition:
+            lambda: 'return (id(g_last_x) - id(g_start_x)) > 60;'
+          then:
+            - lvgl.page.previous:
+                animation: OUT_RIGHT
+                time: 250ms
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 26
+    glyphsets: [GF_Latin_Core]
+  - file: "gfonts://Roboto@500"
+    id: font_med
+    size: 38
+    glyphsets: [GF_Latin_Core]
+  # ENERGIA: afegida la "W" per als valors en watts
+  - file: "gfonts://Roboto@700"
+    id: font_big
+    size: 62
+    glyphs: "0123456789.:+-° /W"
+  - file: "gfonts://Roboto@700"
+    id: font_huge
+    size: 112
+    glyphs: "0123456789.:+-° /"
+  - file: "gfonts://Roboto@900"
+    id: font_clock
+    size: 150
+    glyphs: "0123456789:-"
+  - file: "gfonts://Roboto@700"
+    id: font_w_temp
+    size: 170
+    glyphs: "0123456789.:+-° /"
+  - file: "gfonts://Roboto@500"
+    id: font_w_cond
+    size: 52
+    glyphsets: [GF_Latin_Core]
+  - file: "gfonts://Roboto"
+    id: font_w_minmax
+    size: 26
+    glyphs: "0123456789 Mínàx°-/"
+  - file: "gfonts://Roboto@500"
+    id: font_week
+    size: 28
+    glyphs: ["°"]
+    glyphsets: [GF_Latin_Core]
+  - file: "gfonts://Roboto@500"
+    id: font_vent
+    size: 38
+    glyphsets: [GF_Latin_Core]
+    glyphs: ["°"]
+
+image:
+  - file: images/compass_dial.png
+    id: img_dial
+    resize: 300x300
+    type: RGB565
+    transparency: alpha_channel
+  - file: images/compass_needle.png
+    id: img_needle
+    resize: 300x300
+    type: RGB565
+    transparency: alpha_channel
+
+script:
+  - id: update_alertes
+    then:
+      - lambda: |-
+          std::string t;
+          auto add = [&](text_sensor::TextSensor *s, const char *n) {
+            if (s->state == "opened") {
+              if (!t.empty()) t += ", ";
+              t += n;
+            }
+          };
+          add(id(al_vent), "Vent");
+          add(id(al_pluja_int), "Pluja intensa");
+          add(id(al_pluja_30), "Pluja intensa 30 min");
+          add(id(al_pluja_3h), "Pluja intensa 3 h");
+          add(id(al_pluja), "Pluja");
+          add(id(al_mar), "Mar");
+          add(id(al_fred), "Fred");
+          add(id(al_calor), "Calor");
+          add(id(al_calor_nit), "Calor nocturna");
+          add(id(al_neu), "Neu");
+          if (t.empty()) {
+            lv_obj_add_flag(id(box_alerta), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            std::string m = "Alerta: " + t;
+            lv_label_set_text(id(lbl_alerta), m.c_str());
+            lv_obj_clear_flag(id(box_alerta), LV_OBJ_FLAG_HIDDEN);
+          }
+  - id: sync_llum
+    then:
+      - if:
+          condition:
+            lambda: 'return id(llum_comedor_estat).state;'
+          then:
+            - lvgl.widget.update: { id: btn_llum_comedor, bg_color: 0xF5A623 }
+            - lvgl.label.update:  { id: lbl_llum_comedor, text: "ENCESA", text_color: 0x1B2233 }
+          else:
+            - lvgl.widget.update: { id: btn_llum_comedor, bg_color: 0x25314C }
+            - lvgl.label.update:  { id: lbl_llum_comedor, text: "APAGADA", text_color: 0x7C8BA5 }
+  - id: update_ext
+    then:
+      - lvgl.label.update:
+          id: lbl_ext
+          text: !lambda |-
+            float t = id(ha_ext_temp).state;
+            float r = id(ha_pluja_ara).state;
+            if (isnan(t)) return std::string("");
+            char b[40];
+            if (!isnan(r) && r > 0.0f)
+              snprintf(b, sizeof(b), "Fora %.1f° - Plou", t);
+            else
+              snprintf(b, sizeof(b), "Fora %.1f°", t);
+            return std::string(b);
+  # Estat de la caldera a la pàgina del termòstat (codis S.xx del manual Vaillant)
+  - id: update_caldera
+    then:
+      - lambda: |-
+          float s = id(ha_caldera_state).state;
+          const char *txt = "";
+          uint32_t col = 0xF5A623;
+          static char b[32];
+          if (isnan(s)) {
+            txt = "Caldera: sense dades";
+            col = 0x7C8BA5;
+          } else {
+            int n = (int) s;
+            if (n == 4) {
+              txt = "Caldera: escalfant";
+              col = 0xFF7043;
+            } else if (n >= 0 && n <= 3) {
+              txt = "Caldera: arrencant";
+            } else if (n >= 5 && n <= 7) {
+              txt = "Caldera: aturant";
+            } else if (n == 8) {
+              txt = "Caldera: en espera";
+              col = 0x7C8BA5;
+            } else if (n >= 10 && n <= 17) {
+              txt = "Caldera: aigua calenta";
+              col = 0x56C7DE;
+            } else if (n >= 20 && n <= 28) {
+              txt = "Caldera: arrencada en calent";
+              col = 0x56C7DE;
+            } else if (n == 30) {
+              txt = "Caldera: sense demanda";
+            } else if (n == 31) {
+              txt = "Caldera: en repòs";
+            } else if (n == 53 || n == 54) {
+              txt = "Caldera: espera (S.54)";
+              col = 0xB23A48;
+            } else {
+              snprintf(b, sizeof(b), "Caldera: S.%d", n);
+              txt = b;
+            }
+          }
+          lv_label_set_text(id(lbl_boiler), txt);
+          lv_obj_set_style_text_color(id(lbl_boiler), lv_color_hex(col), 0);
+  - id: redraw_week
+    then:
+      - lambda: |-
+          auto parse = [](const std::string &str, int *out) -> int {
+            int idx = 0; size_t start = 0;
+            while (idx < 7) {
+              size_t c = str.find(',', start);
+              std::string tok = (c == std::string::npos) ? str.substr(start) : str.substr(start, c - start);
+              if (tok.empty()) break;
+              out[idx++] = atoi(tok.c_str());
+              if (c == std::string::npos) break;
+              start = c + 1;
+            }
+            return idx;
+          };
+          int nmax = parse(id(ha_week_max).state, id(wk_max));
+          int nmin = parse(id(ha_week_min).state, id(wk_min));
+          int n = (nmax < nmin) ? nmax : nmin;
+          if (n <= 0) return;
+          float amax = -1000, amin = 1000;
+          for (int i = 0; i < n; i++) {
+            if (id(wk_max)[i] > amax) amax = id(wk_max)[i];
+            if (id(wk_min)[i] < amin) amin = id(wk_min)[i];
+          }
+          amax += 1; amin -= 1;
+          if (amax <= amin) amax = amin + 1;
+          const int Y_TOP = 100, Y_BOT = 360;
+          const float H = Y_BOT - Y_TOP;
+          static const char* dies[] = {"Dg","Dl","Dt","Dc","Dj","Dv","Ds"};
+          auto t = id(sntp_time).now();
+          int dow0 = t.is_valid() ? (t.day_of_week - 1) : 0;
+          lv_obj_t* bars[7] = { id(bar_0),id(bar_1),id(bar_2),id(bar_3),id(bar_4),id(bar_5),id(bar_6) };
+          lv_obj_t* lmx[7]  = { id(lmax_0),id(lmax_1),id(lmax_2),id(lmax_3),id(lmax_4),id(lmax_5),id(lmax_6) };
+          lv_obj_t* lmn[7]  = { id(lmin_0),id(lmin_1),id(lmin_2),id(lmin_3),id(lmin_4),id(lmin_5),id(lmin_6) };
+          lv_obj_t* ldy[7]  = { id(ldia_0),id(ldia_1),id(ldia_2),id(ldia_3),id(ldia_4),id(ldia_5),id(ldia_6) };
+          char buf[8];
+          for (int i = 0; i < 7; i++) {
+            if (i >= n) {
+              lv_obj_add_flag(bars[i], LV_OBJ_FLAG_HIDDEN);
+              lv_label_set_text(lmx[i], "");
+              lv_label_set_text(lmn[i], "");
+              lv_label_set_text(ldy[i], "");
+              continue;
+            }
+            lv_obj_clear_flag(bars[i], LV_OBJ_FLAG_HIDDEN);
+            int ytop = Y_BOT - (int)((id(wk_max)[i] - amin) / (amax - amin) * H);
+            int ybot = Y_BOT - (int)((id(wk_min)[i] - amin) / (amax - amin) * H);
+            int h = ybot - ytop; if (h < 4) h = 4;
+            lv_obj_set_y(bars[i], ytop);
+            lv_obj_set_height(bars[i], h);
+            snprintf(buf, sizeof(buf), "%d\xC2\xB0", id(wk_max)[i]); lv_label_set_text(lmx[i], buf);
+            snprintf(buf, sizeof(buf), "%d\xC2\xB0", id(wk_min)[i]); lv_label_set_text(lmn[i], buf);
+            lv_label_set_text(ldy[i], dies[(dow0 + i) % 7]);
+          }
+
+lvgl:
+  displays:
+    - main_display
+  touchscreens:
+    - main_touch
+  disp_bg_color: 0x0E1524
+  text_font: font_med
+  text_color: 0xF2F5FA
+  on_idle:
+    timeout: 60s
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(g_black);'
+          then:
+            - lvgl.page.show: page_clock
+  pages:
+
+    - id: page_clock
+      bg_color: 0x0E1524
+      bg_opa: COVER
+      widgets:
+        - label:
+            id: lbl_clock
+            align: CENTER
+            y: -20
+            text_font: font_clock
+            text_color: 0x56C7DE
+            text: "--:--"
+        - label:
+            id: lbl_date
+            align: CENTER
+            y: 95
+            text_font: font_med
+            text_color: 0x7C8BA5
+            text: "-- --- ----"
+        - label:
+            id: lbl_ext
+            align: CENTER
+            y: 150
+            text_font: font_vent
+            text_color: 0x7FD8EA
+            text: ""
+        - obj:
+            id: box_alerta
+            align: TOP_MID
+            y: 20
+            width: 740
+            height: 56
+            radius: 12
+            bg_color: 0xB23A48
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            hidden: true
+            widgets:
+              - label:
+                  id: lbl_alerta
+                  align: CENTER
+                  width: 700
+                  long_mode: DOT
+                  text_align: CENTER
+                  text: ""
+                  text_font: font_small
+                  text_color: 0xFFFFFF
+
+    - id: page_thermo
+      bg_color: 0x0E1524
+      bg_opa: COVER
+      widgets:
+        - label:
+            align: TOP_MID
+            y: 55
+            text: "TEMPERATURA"
+            text_font: font_small
+            text_color: 0x7C8BA5
+        - label:
+            id: lbl_temp_now
+            align: TOP_MID
+            y: 83
+            text_font: font_huge
+            text_color: 0x7FD8EA
+            text: "21.3°"
+        - label:
+            id: lbl_boiler
+            align: TOP_MID
+            y: 210
+            text: "Caldera: en repòs"
+            text_font: font_small
+            text_color: 0xF5A623
+        - label:
+            align: TOP_MID
+            y: 262
+            text: "CONSIGNA"
+            text_font: font_small
+            text_color: 0x7C8BA5
+        - button:
+            align: TOP_MID
+            x: -175
+            y: 290
+            width: 92
+            height: 92
+            bg_color: 0x25314C
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "-"
+                  text_font: font_big
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_swiped);'
+                  then:
+                    - homeassistant.action:
+                        action: climate.set_temperature
+                        data_template:
+                          entity_id: "${thermostat_entity}"
+                          temperature: "{{ t }}"
+                        variables:
+                          t: |-
+                            float s = id(ha_setpoint).state;
+                            if (isnan(s)) s = id(temp_salon).state;
+                            return s - 0.5;
+        - label:
+            id: lbl_setpoint
+            align: TOP_MID
+            y: 305
+            text: "--°"
+            text_font: font_big
+            text_color: 0x4ADE80
+        - button:
+            align: TOP_MID
+            x: 175
+            y: 290
+            width: 92
+            height: 92
+            bg_color: 0x25314C
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "+"
+                  text_font: font_big
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_swiped);'
+                  then:
+                    - homeassistant.action:
+                        action: climate.set_temperature
+                        data_template:
+                          entity_id: "${thermostat_entity}"
+                          temperature: "{{ t }}"
+                        variables:
+                          t: |-
+                            float s = id(ha_setpoint).state;
+                            if (isnan(s)) s = id(temp_salon).state;
+                            return s + 0.5;
+
+    - id: page_weather
+      bg_color: 0x0E1524
+      bg_opa: COVER
+      widgets:
+        - label:
+            align: CENTER
+            y: -165
+            text: "${town_name}"
+            text_font: font_med
+            text_color: 0x7C8BA5
+        - label:
+            id: lbl_w_temp
+            align: CENTER
+            y: -25
+            text: "--°"
+            text_font: font_w_temp
+            text_color: 0xFFB454
+        - label:
+            id: lbl_w_cond
+            align: CENTER
+            y: 125
+            text: "..."
+            text_font: font_w_cond
+            text_color: 0xFFB454
+        - label:
+            id: lbl_w_minmax
+            align: CENTER
+            y: 172
+            text: "Mín --    Màx --"
+            text_font: font_w_minmax
+            text_color: 0x7C8BA5
+        - label:
+            id: lbl_w_wind
+            align: CENTER
+            y: 215
+            text: "Vent --   Humitat --"
+            text_font: font_small
+            text_color: 0x7C8BA5
+
+    - id: page_weather2
+      bg_color: 0x0E1524
+      bg_opa: COVER
+      widgets:
+        - label:
+            align: TOP_MID
+            y: 40
+            text: "AVUI A ${town_name}"
+            text_font: font_med
+            text_color: 0x7C8BA5
+        - label:
+            align: CENTER
+            y: -110
+            text: "SORTIDA DE SOL"
+            text_font: font_small
+            text_color: 0x7C8BA5
+        - label:
+            id: lbl_sol_sortida
+            align: CENTER
+            y: -62
+            text: "--:--"
+            text_font: font_w_cond
+            text_color: 0xFFB454
+        - label:
+            align: CENTER
+            y: 0
+            text: "POSTA DE SOL"
+            text_font: font_small
+            text_color: 0x7C8BA5
+        - label:
+            id: lbl_sol_posta
+            align: CENTER
+            y: 48
+            text: "--:--"
+            text_font: font_w_cond
+            text_color: 0xFF7043
+        - label:
+            align: CENTER
+            y: 112
+            text: "PROBABILITAT DE PLUJA"
+            text_font: font_small
+            text_color: 0x7C8BA5
+        - label:
+            id: lbl_prob_pluja
+            align: CENTER
+            y: 158
+            text: "--%"
+            text_font: font_w_cond
+            text_color: 0x56C7DE
+
+    - id: page_vent
+      bg_color: 0x0E1524
+      bg_opa: COVER
+      widgets:
+        - label:
+            align: TOP_MID
+            y: 20
+            text: "VENT I PLUJA"
+            text_font: font_med
+            text_color: 0x56C7DE
+        - image:
+            src: img_dial
+            align: TOP_LEFT
+            x: 50
+            y: 110
+        - image:
+            id: img_agulla
+            src: img_needle
+            align: TOP_LEFT
+            x: 50
+            y: 110
+            pivot_x: 150
+            pivot_y: 150
+        - label:
+            align: TOP_LEFT
+            x: 420
+            y: 95
+            text: "DIRECCIÓ"
+            text_font: font_small
+            text_color: 0x7C8BA5
+        - label:
+            id: lbl_vent_dir
+            align: TOP_LEFT
+            x: 420
+            y: 122
+            text: "--"
+            text_font: font_vent
+            text_color: 0xFFB454
+        - label:
+            align: TOP_LEFT
+            x: 420
+            y: 190
+            text: "VELOCITAT"
+            text_font: font_small
+            text_color: 0x7C8BA5
+        - label:
+            id: lbl_vent_vel
+            align: TOP_LEFT
+            x: 420
+            y: 217
+            text: "--"
+            text_font: font_vent
+            text_color: 0x56C7DE
+        - label:
+            align: TOP_LEFT
+            x: 420
+            y: 285
+            text: "RÀFEGUES"
+            text_font: font_small
+            text_color: 0x7C8BA5
+        - label:
+            id: lbl_vent_racha
+            align: TOP_LEFT
+            x: 420
+            y: 312
+            text: "--"
+            text_font: font_vent
+            text_color: 0x56C7DE
+        - label:
+            align: TOP_LEFT
+            x: 420
+            y: 380
+            text: "PLUJA (ARA / AVUI)"
+            text_font: font_small
+            text_color: 0x7C8BA5
+        - label:
+            id: lbl_pluja
+            align: TOP_LEFT
+            x: 420
+            y: 407
+            text: "--"
+            text_font: font_vent
+            text_color: 0x7FD8EA
+
+    - id: page_setmana
+      bg_color: 0x0E1524
+      bg_opa: COVER
+      widgets:
+        - label:
+            align: TOP_MID
+            y: 20
+            text: "PREVISIÓ 7 DIES"
+            text_font: font_med
+            text_color: 0x56C7DE
+        - obj:
+            id: bar_0
+            align: TOP_MID
+            x: -324
+            y: 100
+            width: 46
+            height: 10
+            radius: 4
+            bg_color: 0xFF8C42
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+        - label: { id: lmax_0, align: TOP_MID, x: -324, y: 70,  text: "", text_font: font_week, text_color: 0xFFB454 }
+        - label: { id: lmin_0, align: TOP_MID, x: -324, y: 366, text: "", text_font: font_week, text_color: 0x7FD8EA }
+        - label: { id: ldia_0, align: TOP_MID, x: -324, y: 410, text: "", text_font: font_week, text_color: 0x7C8BA5 }
+        - obj:
+            id: bar_1
+            align: TOP_MID
+            x: -216
+            y: 100
+            width: 46
+            height: 10
+            radius: 4
+            bg_color: 0xFF8C42
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+        - label: { id: lmax_1, align: TOP_MID, x: -216, y: 70,  text: "", text_font: font_week, text_color: 0xFFB454 }
+        - label: { id: lmin_1, align: TOP_MID, x: -216, y: 366, text: "", text_font: font_week, text_color: 0x7FD8EA }
+        - label: { id: ldia_1, align: TOP_MID, x: -216, y: 410, text: "", text_font: font_week, text_color: 0x7C8BA5 }
+        - obj:
+            id: bar_2
+            align: TOP_MID
+            x: -108
+            y: 100
+            width: 46
+            height: 10
+            radius: 4
+            bg_color: 0xFF8C42
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+        - label: { id: lmax_2, align: TOP_MID, x: -108, y: 70,  text: "", text_font: font_week, text_color: 0xFFB454 }
+        - label: { id: lmin_2, align: TOP_MID, x: -108, y: 366, text: "", text_font: font_week, text_color: 0x7FD8EA }
+        - label: { id: ldia_2, align: TOP_MID, x: -108, y: 410, text: "", text_font: font_week, text_color: 0x7C8BA5 }
+        - obj:
+            id: bar_3
+            align: TOP_MID
+            x: 0
+            y: 100
+            width: 46
+            height: 10
+            radius: 4
+            bg_color: 0xFF8C42
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+        - label: { id: lmax_3, align: TOP_MID, x: 0, y: 70,  text: "", text_font: font_week, text_color: 0xFFB454 }
+        - label: { id: lmin_3, align: TOP_MID, x: 0, y: 366, text: "", text_font: font_week, text_color: 0x7FD8EA }
+        - label: { id: ldia_3, align: TOP_MID, x: 0, y: 410, text: "", text_font: font_week, text_color: 0x7C8BA5 }
+        - obj:
+            id: bar_4
+            align: TOP_MID
+            x: 108
+            y: 100
+            width: 46
+            height: 10
+            radius: 4
+            bg_color: 0xFF8C42
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+        - label: { id: lmax_4, align: TOP_MID, x: 108, y: 70,  text: "", text_font: font_week, text_color: 0xFFB454 }
+        - label: { id: lmin_4, align: TOP_MID, x: 108, y: 366, text: "", text_font: font_week, text_color: 0x7FD8EA }
+        - label: { id: ldia_4, align: TOP_MID, x: 108, y: 410, text: "", text_font: font_week, text_color: 0x7C8BA5 }
+        - obj:
+            id: bar_5
+            align: TOP_MID
+            x: 216
+            y: 100
+            width: 46
+            height: 10
+            radius: 4
+            bg_color: 0xFF8C42
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+        - label: { id: lmax_5, align: TOP_MID, x: 216, y: 70,  text: "", text_font: font_week, text_color: 0xFFB454 }
+        - label: { id: lmin_5, align: TOP_MID, x: 216, y: 366, text: "", text_font: font_week, text_color: 0x7FD8EA }
+        - label: { id: ldia_5, align: TOP_MID, x: 216, y: 410, text: "", text_font: font_week, text_color: 0x7C8BA5 }
+        - obj:
+            id: bar_6
+            align: TOP_MID
+            x: 324
+            y: 100
+            width: 46
+            height: 10
+            radius: 4
+            bg_color: 0xFF8C42
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+        - label: { id: lmax_6, align: TOP_MID, x: 324, y: 70,  text: "", text_font: font_week, text_color: 0xFFB454 }
+        - label: { id: lmin_6, align: TOP_MID, x: 324, y: 366, text: "", text_font: font_week, text_color: 0x7FD8EA }
+        - label: { id: ldia_6, align: TOP_MID, x: 324, y: 410, text: "", text_font: font_week, text_color: 0x7C8BA5 }
+
+    # ===================== ENERGIA (nova) =====================
+    - id: page_energia
+      bg_color: 0x0E1524
+      bg_opa: COVER
+      widgets:
+        - label:
+            align: TOP_MID
+            y: 20
+            text: "ENERGIA"
+            text_font: font_med
+            text_color: 0x56C7DE
+
+        # --- SOL ---
+        - obj:
+            x: 20
+            y: 80
+            width: 240
+            height: 200
+            radius: 16
+            bg_color: 0x1A2338
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            widgets:
+              - label: { align: TOP_MID, y: 18, text: "SOL", text_font: font_small, text_color: 0xFFB454 }
+              - label: { id: lbl_fv, align: CENTER, y: 14, text: "--", text_font: font_big, text_color: 0xF2F5FA }
+
+        # --- CASA ---
+        - obj:
+            x: 280
+            y: 80
+            width: 240
+            height: 200
+            radius: 16
+            bg_color: 0x1A2338
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            widgets:
+              - label: { align: TOP_MID, y: 18, text: "CASA", text_font: font_small, text_color: 0x56C7DE }
+              - label: { id: lbl_consum, align: CENTER, y: 14, text: "--", text_font: font_big, text_color: 0xF2F5FA }
+
+        # --- XARXA ---
+        - obj:
+            x: 540
+            y: 80
+            width: 240
+            height: 200
+            radius: 16
+            bg_color: 0x1A2338
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            widgets:
+              - label: { align: TOP_MID, y: 18, text: "XARXA", text_font: font_small, text_color: 0x7C8BA5 }
+              - label: { id: lbl_xarxa, align: CENTER, y: 4, text: "--", text_font: font_big, text_color: 0xF2F5FA }
+              - label: { id: lbl_xarxa_dir, align: BOTTOM_MID, y: -14, text: "", text_font: font_small, text_color: 0x7C8BA5 }
+
+        # --- SEMÀFOR ---
+        - obj:
+            id: box_semafor
+            x: 20
+            y: 300
+            width: 760
+            height: 160
+            radius: 16
+            bg_color: 0x25314C
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            widgets:
+              - label:
+                  id: lbl_semafor
+                  align: CENTER
+                  width: 720
+                  long_mode: WRAP
+                  text_align: CENTER
+                  text: "..."
+                  text_font: font_med
+                  text_color: 0xF2F5FA
+    # ==========================================================
+
+    - id: page_tendal
+      bg_color: 0x0E1524
+      bg_opa: COVER
+      widgets:
+        - label:
+            align: TOP_MID
+            y: 55
+            text: "TENDALL"
+            text_font: font_med
+            text_color: 0x56C7DE
+
+        # --- Accions: Pujar / Parar / Baixar ---
+        - button:
+            align: CENTER
+            x: -240
+            y: 30
+            width: 210
+            height: 210
+            bg_color: 0x25314C
+            widgets:
+              - label: { align: CENTER, text: "Pujar", text_font: font_med, text_color: 0x7FD8EA }
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_swiped);'
+                  then:
+                    - homeassistant.action:
+                        action: cover.open_cover
+                        data: { entity_id: "${awning_entity}" }
+        - button:
+            align: CENTER
+            x: 0
+            y: 30
+            width: 210
+            height: 210
+            bg_color: 0x25314C
+            widgets:
+              - label: { align: CENTER, text: "Parar", text_font: font_med, text_color: 0xF5A623 }
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_swiped);'
+                  then:
+                    - homeassistant.action:
+                        action: cover.stop_cover
+                        data: { entity_id: "${awning_entity}" }
+        - button:
+            align: CENTER
+            x: 240
+            y: 30
+            width: 210
+            height: 210
+            bg_color: 0x25314C
+            widgets:
+              - label: { align: CENTER, text: "Baixar", text_font: font_med, text_color: 0x7FD8EA }
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_swiped);'
+                  then:
+                    - homeassistant.action:
+                        action: cover.close_cover
+                        data: { entity_id: "${awning_entity}" }
+
+    - id: page_persianas
+      bg_color: 0x0E1524
+      bg_opa: COVER
+      widgets:
+        - label:
+            id: lbl_persiana_sel
+            align: TOP_MID
+            y: 30
+            text: "PERSIANA DRETA"
+            text_font: font_med
+            text_color: 0x56C7DE
+
+        # --- Selector: Dreta / Esquerra ---
+        - button:
+            id: btn_sel_dreta
+            align: TOP_MID
+            x: -125
+            y: 90
+            width: 230
+            height: 60
+            bg_color: 0x2E7D5B
+            widgets:
+              - label: { align: CENTER, text: "Dreta", text_font: font_small }
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_swiped);'
+                  then:
+                    - lambda: 'id(sel_persiana) = 0;'
+                    - lvgl.widget.update: { id: btn_sel_dreta,    bg_color: 0x2E7D5B }
+                    - lvgl.widget.update: { id: btn_sel_esquerra, bg_color: 0x25314C }
+                    - lvgl.label.update:  { id: lbl_persiana_sel, text: "PERSIANA DRETA" }
+        - button:
+            id: btn_sel_esquerra
+            align: TOP_MID
+            x: 125
+            y: 90
+            width: 230
+            height: 60
+            bg_color: 0x25314C
+            widgets:
+              - label: { align: CENTER, text: "Esquerra", text_font: font_small }
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_swiped);'
+                  then:
+                    - lambda: 'id(sel_persiana) = 1;'
+                    - lvgl.widget.update: { id: btn_sel_dreta,    bg_color: 0x25314C }
+                    - lvgl.widget.update: { id: btn_sel_esquerra, bg_color: 0x2E7D5B }
+                    - lvgl.label.update:  { id: lbl_persiana_sel, text: "PERSIANA ESQUERRA" }
+
+        # --- Accions: Pujar / Parar / Baixar ---
+        - button:
+            align: TOP_MID
+            x: -240
+            y: 200
+            width: 210
+            height: 210
+            bg_color: 0x25314C
+            widgets:
+              - label: { align: CENTER, text: "Pujar", text_font: font_med, text_color: 0x7FD8EA }
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_swiped);'
+                  then:
+                    - homeassistant.action:
+                        action: cover.open_cover
+                        data_template: { entity_id: "{{ ent }}" }
+                        variables:
+                          ent: |-
+                            return id(sel_persiana) == 1
+                              ? std::string("${blind_left_entity}")
+                              : std::string("${blind_right_entity}");
+        - button:
+            align: TOP_MID
+            x: 0
+            y: 200
+            width: 210
+            height: 210
+            bg_color: 0x25314C
+            widgets:
+              - label: { align: CENTER, text: "Parar", text_font: font_med, text_color: 0xF5A623 }
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_swiped);'
+                  then:
+                    - homeassistant.action:
+                        action: cover.stop_cover
+                        data_template: { entity_id: "{{ ent }}" }
+                        variables:
+                          ent: |-
+                            return id(sel_persiana) == 1
+                              ? std::string("${blind_left_entity}")
+                              : std::string("${blind_right_entity}");
+        - button:
+            align: TOP_MID
+            x: 240
+            y: 200
+            width: 210
+            height: 210
+            bg_color: 0x25314C
+            widgets:
+              - label: { align: CENTER, text: "Baixar", text_font: font_med, text_color: 0x7FD8EA }
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_swiped);'
+                  then:
+                    - homeassistant.action:
+                        action: cover.close_cover
+                        data_template: { entity_id: "{{ ent }}" }
+                        variables:
+                          ent: |-
+                            return id(sel_persiana) == 1
+                              ? std::string("${blind_left_entity}")
+                              : std::string("${blind_right_entity}");
+
+    - id: page_llum
+      bg_color: 0x0E1524
+      bg_opa: COVER
+      on_load:
+        - script.execute: sync_llum
+      widgets:
+        - label:
+            align: TOP_MID
+            y: 55
+            text: "MENJADOR"
+            text_font: font_med
+            text_color: 0x56C7DE
+        - button:
+            id: btn_llum_comedor
+            align: CENTER
+            y: 20
+            width: 320
+            height: 240
+            bg_color: 0x25314C
+            widgets:
+              - label:
+                  id: lbl_llum_comedor
+                  align: CENTER
+                  text: "APAGADA"
+                  text_font: font_med
+                  text_color: 0x7C8BA5
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(g_swiped);'
+                  then:
+                    - homeassistant.action:
+                        action: switch.toggle
+                        data: { entity_id: "${lamp_entity}" }
+
+    - id: page_black
+      skip: true
+      bg_color: 0x000000
+      bg_opa: COVER
+
+interval:
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(sntp_time).now().is_valid();'
+          then:
+            - lvgl.label.update:
+                id: lbl_clock
+                text: !lambda |-
+                  auto t = id(sntp_time).now();
+                  char b[8]; snprintf(b, sizeof(b), "%02d:%02d", t.hour, t.minute);
+                  return std::string(b);
+            - lvgl.label.update:
+                id: lbl_date
+                text: !lambda |-
+                  static const char* dies[] = {"Dg","Dl","Dt","Dc","Dj","Dv","Ds"};
+                  static const char* mesos[] = {"gen","feb","mar","abr","mai","jun","jul","ago","set","oct","nov","des"};
+                  auto t = id(sntp_time).now();
+                  char b[24];
+                  snprintf(b, sizeof(b), "%s %d %s %d", dies[t.day_of_week-1], t.day_of_month, mesos[t.month-1], t.year);
+                  return std::string(b);
+
+binary_sensor:
+  - platform: homeassistant
+    id: presencia_salon
+    entity_id: "${presence_entity}"
+    filters:
+      - delayed_off: 180s
+    on_press:
+      - lvgl.page.show: page_clock
+      - lambda: 'id(g_black) = false;'
+    on_release:
+      - lvgl.page.show: page_black
+      - lambda: 'id(g_black) = true;'
+
+  # --- Estat de la llum del menjador (lamp_entity) ---
+  - platform: homeassistant
+    id: llum_comedor_estat
+    entity_id: "${lamp_entity}"
+    on_state:
+      - script.execute: sync_llum
+
+sensor:
+  - platform: sht3xd
+    address: 0x44
+    update_interval: 30s
+    temperature:
+      name: "Temperatura Salón"
+      id: temp_salon
+      filters:
+        - offset: ${temp_offset}
+      on_value:
+        - lvgl.label.update:
+            id: lbl_temp_now
+            text: !lambda |-
+              char b[16]; snprintf(b, sizeof(b), "%.1f°", x);
+              return std::string(b);
+    humidity:
+      name: "Humedad Salón"
+      id: hum_salon
+
+  # --- Consigna real de la caldera (thermostat_entity) ---
+  - platform: homeassistant
+    id: ha_setpoint
+    entity_id: "${thermostat_entity}"
+    attribute: temperature
+    on_value:
+      - lvgl.label.update:
+          id: lbl_setpoint
+          text: !lambda |-
+            if (isnan(x)) return std::string("--°");
+            char b[16]; snprintf(b, sizeof(b), "%.1f°", x);
+            return std::string(b);
+
+  # --- Estat de la caldera (codi S.xx via eBUS, l'actualitza HA cada minut) ---
+  - platform: homeassistant
+    id: ha_caldera_state
+    entity_id: "${boiler_state_entity}"
+    on_value:
+      - script.execute: update_caldera
+
+  - platform: homeassistant
+    id: ha_w_temp
+    entity_id: "weather.meteocat_up_weather_${meteocat_station}"
+    attribute: temperature
+    on_value:
+      - lvgl.label.update:
+          id: lbl_w_temp
+          text: !lambda |-
+            char b[8]; snprintf(b, sizeof(b), "%.0f°", x);
+            return std::string(b);
+  - platform: homeassistant
+    id: ha_w_max
+    entity_id: "${today_max_entity}"
+    on_value:
+      - lvgl.label.update:
+          id: lbl_w_minmax
+          text: !lambda |-
+            if (isnan(id(ha_w_min).state) || isnan(id(ha_w_max).state))
+              return std::string("Mín --    Màx --");
+            char b[32];
+            snprintf(b, sizeof(b), "Mín %.0f°    Màx %.0f°", id(ha_w_min).state, id(ha_w_max).state);
+            return std::string(b);
+  - platform: homeassistant
+    id: ha_w_min
+    entity_id: "${today_min_entity}"
+    on_value:
+      - lvgl.label.update:
+          id: lbl_w_minmax
+          text: !lambda |-
+            if (isnan(id(ha_w_min).state) || isnan(id(ha_w_max).state))
+              return std::string("Mín --    Màx --");
+            char b[32];
+            snprintf(b, sizeof(b), "Mín %.0f°    Màx %.0f°", id(ha_w_min).state, id(ha_w_max).state);
+            return std::string(b);
+
+  - platform: homeassistant
+    id: ha_w_wind
+    entity_id: "weather.meteocat_up_weather_${meteocat_station}"
+    attribute: wind_speed
+    on_value:
+      - lvgl.label.update:
+          id: lbl_w_wind
+          text: !lambda |-
+            float w = id(ha_w_wind).state;
+            float h = id(ha_w_hum).state;
+            float br = id(ha_w_windbear).state;
+            static const char* dirs[] = {"N","NE","E","SE","S","SO","O","NO"};
+            const char* d = isnan(br) ? "" : dirs[((int)((br + 22.5f) / 45.0f)) % 8];
+            char b[48];
+            if (isnan(w) || isnan(h))
+              snprintf(b, sizeof(b), "Vent --   Humitat --");
+            else
+              snprintf(b, sizeof(b), "Vent %.0f km/h %s   Humitat %.0f%%", w, d, h);
+            return std::string(b);
+  - platform: homeassistant
+    id: ha_w_windbear
+    entity_id: "weather.meteocat_up_weather_${meteocat_station}"
+    attribute: wind_bearing
+    on_value:
+      - lvgl.label.update:
+          id: lbl_w_wind
+          text: !lambda |-
+            float w = id(ha_w_wind).state;
+            float h = id(ha_w_hum).state;
+            float br = id(ha_w_windbear).state;
+            static const char* dirs[] = {"N","NE","E","SE","S","SO","O","NO"};
+            const char* d = isnan(br) ? "" : dirs[((int)((br + 22.5f) / 45.0f)) % 8];
+            char b[48];
+            if (isnan(w) || isnan(h))
+              snprintf(b, sizeof(b), "Vent --   Humitat --");
+            else
+              snprintf(b, sizeof(b), "Vent %.0f km/h %s   Humitat %.0f%%", w, d, h);
+            return std::string(b);
+  - platform: homeassistant
+    id: ha_w_hum
+    entity_id: "weather.meteocat_up_weather_${meteocat_station}"
+    attribute: humidity
+    on_value:
+      - lvgl.label.update:
+          id: lbl_w_wind
+          text: !lambda |-
+            float w = id(ha_w_wind).state;
+            float h = id(ha_w_hum).state;
+            float br = id(ha_w_windbear).state;
+            static const char* dirs[] = {"N","NE","E","SE","S","SO","O","NO"};
+            const char* d = isnan(br) ? "" : dirs[((int)((br + 22.5f) / 45.0f)) % 8];
+            char b[48];
+            if (isnan(w) || isnan(h))
+              snprintf(b, sizeof(b), "Vent --   Humitat --");
+            else
+              snprintf(b, sizeof(b), "Vent %.0f km/h %s   Humitat %.0f%%", w, d, h);
+            return std::string(b);
+
+  - platform: homeassistant
+    id: ha_prob_pluja
+    entity_id: "${rain_probability_entity}"
+    on_value:
+      - lvgl.label.update:
+          id: lbl_prob_pluja
+          text: !lambda |-
+            if (isnan(x)) return std::string("--%");
+            char b[8]; snprintf(b, sizeof(b), "%.0f%%", x);
+            return std::string(b);
+
+  # ===================== ENERGIA =====================
+  - platform: homeassistant
+    id: ha_fv
+    entity_id: "${solar_power_entity}"
+    on_value:
+      - lvgl.label.update:
+          id: lbl_fv
+          text: !lambda |-
+            if (isnan(x)) return std::string("--");
+            char b[16]; snprintf(b, sizeof(b), "%.0f W", x);
+            return std::string(b);
+
+  - platform: homeassistant
+    id: ha_consum
+    entity_id: "${house_power_entity}"
+    on_value:
+      - lvgl.label.update:
+          id: lbl_consum
+          text: !lambda |-
+            if (isnan(x)) return std::string("--");
+            char b[16]; snprintf(b, sizeof(b), "%.0f W", x);
+            return std::string(b);
+
+  # Positiu = comprant de la xarxa, negatiu = venent
+  - platform: homeassistant
+    id: ha_xarxa
+    entity_id: "${grid_power_entity}"
+    on_value:
+      - lvgl.label.update:
+          id: lbl_xarxa
+          text: !lambda |-
+            if (isnan(x)) return std::string("--");
+            char b[16]; snprintf(b, sizeof(b), "%.0f W", fabsf(x));
+            return std::string(b);
+      - lvgl.label.update:
+          id: lbl_xarxa_dir
+          text: !lambda |-
+            if (isnan(x)) return std::string("");
+            if (x > 20)  return std::string("comprant");
+            if (x < -20) return std::string("venent");
+            return std::string("en equilibri");
+
+  # ===================== VENT I PLUJA =====================
+  - platform: homeassistant
+    id: ha_vent_dir
+    entity_id: "sensor.meteocat_up_${meteocat_station}_viento_direccion"
+    on_value:
+      - lvgl.image.update:
+          id: img_agulla
+          angle: !lambda 'return isnan(x) ? 0 : (int)(x * 10);'
+      - lvgl.label.update:
+          id: lbl_vent_dir
+          text: !lambda |-
+            static const char* v[] = {"Tramuntana","Gregal","Llevant","Xaloc","Migjorn","Garbí","Ponent","Mestral"};
+            if (isnan(x)) return std::string("--");
+            char b[32];
+            snprintf(b, sizeof(b), "%s %.0f°", v[((int)((x + 22.5f) / 45.0f)) % 8], x);
+            return std::string(b);
+
+  - platform: homeassistant
+    id: ha_vent_vel
+    entity_id: "sensor.meteocat_up_${meteocat_station}_viento_velocidad"
+    on_value:
+      - lvgl.label.update:
+          id: lbl_vent_vel
+          text: !lambda |-
+            if (isnan(x)) return std::string("--");
+            char b[16]; snprintf(b, sizeof(b), "%.0f km/h", x);
+            return std::string(b);
+
+  - platform: homeassistant
+    id: ha_vent_racha
+    entity_id: "sensor.meteocat_up_${meteocat_station}_viento_racha"
+    on_value:
+      - lvgl.label.update:
+          id: lbl_vent_racha
+          text: !lambda |-
+            if (isnan(x)) return std::string("--");
+            char b[16]; snprintf(b, sizeof(b), "%.0f km/h", x);
+            return std::string(b);
+
+  - platform: homeassistant
+    id: ha_ext_temp
+    entity_id: "sensor.meteocat_up_${meteocat_station}_temperatura"
+    on_value:
+      - script.execute: update_ext
+
+  - platform: homeassistant
+    id: ha_pluja_ara
+    entity_id: "sensor.meteocat_up_${meteocat_station}_precipitacion"
+    on_value:
+      - script.execute: update_ext
+      - lvgl.label.update:
+          id: lbl_pluja
+          text: !lambda |-
+            char b[40];
+            snprintf(b, sizeof(b), "%.1f / %.1f mm", id(ha_pluja_ara).state, id(ha_pluja_dia).state);
+            return std::string(b);
+
+  - platform: homeassistant
+    id: ha_pluja_dia
+    entity_id: "sensor.meteocat_up_${meteocat_station}_precipitacion_acumulada"
+    on_value:
+      - lvgl.label.update:
+          id: lbl_pluja
+          text: !lambda |-
+            char b[40];
+            snprintf(b, sizeof(b), "%.1f / %.1f mm", id(ha_pluja_ara).state, id(ha_pluja_dia).state);
+            return std::string(b);
+
+text_sensor:
+  - platform: homeassistant
+    id: ha_w_cond
+    entity_id: "weather.meteocat_up_weather_${meteocat_station}"
+    on_value:
+      - lvgl.label.update:
+          id: lbl_w_cond
+          text: !lambda |-
+            if (x == "sunny")         return std::string("Assolellat");
+            if (x == "clear-night")   return std::string("Nit clara");
+            if (x == "partlycloudy")  return std::string("Mig ennuvolat");
+            if (x == "cloudy")        return std::string("Ennuvolat");
+            if (x == "rainy")         return std::string("Pluja");
+            if (x == "pouring")       return std::string("Pluja forta");
+            if (x == "lightning" || x == "lightning-rainy") return std::string("Tempesta");
+            if (x == "snowy")         return std::string("Neu");
+            if (x == "snowy-rainy")   return std::string("Aiguaneu");
+            if (x == "fog")           return std::string("Boira");
+            if (x == "hail")          return std::string("Calamarsa");
+            if (x == "windy" || x == "windy-variant") return std::string("Vent");
+            return std::string(x.c_str());
+
+  - platform: homeassistant
+    id: ha_sol_sortida
+    entity_id: "${sunrise_entity}"
+    on_value:
+      - lvgl.label.update:
+          id: lbl_sol_sortida
+          text: !lambda 'return x;'
+  - platform: homeassistant
+    id: ha_sol_posta
+    entity_id: "${sunset_entity}"
+    on_value:
+      - lvgl.label.update:
+          id: lbl_sol_posta
+          text: !lambda 'return x;'
+
+  - platform: homeassistant
+    id: ha_week_max
+    entity_id: "${week_forecast_entity}"
+    attribute: maxs
+    on_value:
+      - script.execute: redraw_week
+  - platform: homeassistant
+    id: ha_week_min
+    entity_id: "${week_forecast_entity}"
+    attribute: mins
+    on_value:
+      - script.execute: redraw_week
+
+  # ===================== ENERGIA: semàfor =====================
+  - platform: homeassistant
+    id: ha_semafor
+    entity_id: "${appliance_signal_entity}"
+    on_value:
+      - if:
+          condition:
+            lambda: 'return x == "verd";'
+          then:
+            - lvgl.widget.update: { id: box_semafor, bg_color: 0x2E7D5B }
+            - lvgl.label.update:  { id: lbl_semafor, text: "Bon moment per posar rentadora o rentaplats" }
+      - if:
+          condition:
+            lambda: 'return x == "ambre";'
+          then:
+            - lvgl.widget.update: { id: box_semafor, bg_color: 0xB7791F }
+            - lvgl.label.update:  { id: lbl_semafor, text: "Justet: millor esperar una mica" }
+      - if:
+          condition:
+            lambda: 'return x == "vermell";'
+          then:
+            - lvgl.widget.update: { id: box_semafor, bg_color: 0xB23A48 }
+            - lvgl.label.update:  { id: lbl_semafor, text: "Ara no: estaríem comprant llum" }
+      - if:
+          condition:
+            lambda: 'return x == "nit";'
+          then:
+            - lvgl.widget.update: { id: box_semafor, bg_color: 0x25314C }
+            - lvgl.label.update:  { id: lbl_semafor, text: "Sense sol: millor demà al matí" }
+
+  # ===================== ALERTES METEOCAT =====================
+  - platform: homeassistant
+    id: al_vent
+    entity_id: "sensor.meteocat_up_${meteocat_station}_alerta_viento"
+    on_value:
+      - script.execute: update_alertes
+  - platform: homeassistant
+    id: al_pluja_int
+    entity_id: "sensor.meteocat_up_${meteocat_station}_alerta_intensidad_lluvia"
+    on_value:
+      - script.execute: update_alertes
+  - platform: homeassistant
+    id: al_pluja_30
+    entity_id: "sensor.meteocat_up_${meteocat_station}_alerta_intensidad_lluvia_30_min"
+    on_value:
+      - script.execute: update_alertes
+  - platform: homeassistant
+    id: al_pluja_3h
+    entity_id: "sensor.meteocat_up_${meteocat_station}_alerta_intensidad_lluvia_3_horas"
+    on_value:
+      - script.execute: update_alertes
+  - platform: homeassistant
+    id: al_pluja
+    entity_id: "sensor.meteocat_up_${meteocat_station}_alerta_lluvia"
+    on_value:
+      - script.execute: update_alertes
+  - platform: homeassistant
+    id: al_mar
+    entity_id: "sensor.meteocat_up_${meteocat_station}_alerta_mar"
+    on_value:
+      - script.execute: update_alertes
+  - platform: homeassistant
+    id: al_fred
+    entity_id: "sensor.meteocat_up_${meteocat_station}_alerta_frio"
+    on_value:
+      - script.execute: update_alertes
+  - platform: homeassistant
+    id: al_calor
+    entity_id: "sensor.meteocat_up_${meteocat_station}_alerta_calor"
+    on_value:
+      - script.execute: update_alertes
+  - platform: homeassistant
+    id: al_calor_nit
+    entity_id: "sensor.meteocat_up_${meteocat_station}_alerta_calor_nocturno"
+    on_value:
+      - script.execute: update_alertes
+  - platform: homeassistant
+    id: al_neu
+    entity_id: "sensor.meteocat_up_${meteocat_station}_alerta_nieve"
+    on_value:
+      - script.execute: update_alertes
